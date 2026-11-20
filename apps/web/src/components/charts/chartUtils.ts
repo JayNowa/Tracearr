@@ -44,13 +44,42 @@ export function buildPerServerSeries<T extends { serverId: string }>(
   });
 }
 
-// chart-1 and chart-2 are both the accent hue and chart-3 sits beside the default accent, so the
-// three groups take the palette's three distinct hues: accent, amber and red.
+/** Unordered categories (platforms, top lists) cycle these in order. */
+export const CATEGORICAL_COLORS = [
+  'oklch(var(--chart-1))',
+  'oklch(var(--chart-2))',
+  'oklch(var(--chart-3))',
+  'oklch(var(--chart-4))',
+  'oklch(var(--chart-5))',
+  'oklch(var(--chart-6))',
+  'oklch(var(--chart-7))',
+  'oklch(var(--chart-8))',
+] as const;
+
+export const MEDIA_TYPE_COLORS = {
+  movie: 'oklch(var(--media-movie))',
+  show: 'oklch(var(--media-show))',
+  music: 'oklch(var(--media-music))',
+} as const;
+
+export const PLAYBACK_COLORS = {
+  directPlay: 'oklch(var(--playback-direct))',
+  directStream: 'oklch(var(--playback-copy))',
+  audioTranscode: 'oklch(var(--playback-audio))',
+  transcode: 'oklch(var(--playback-transcode))',
+} as const;
+
+/** Fill for stacked areas: light enough that the series below and the grid show through. */
+export const STACKED_AREA_FILL_OPACITY = 0.25;
+
+/** Donut segments separated by the card color, so adjacent ramp steps stay apart. */
+export const PIE_SEGMENT_BORDER = { borderWidth: 2, borderColor: 'oklch(var(--card))' } as const;
+
 const MEDIA_GROUP_SERIES = [
-  { group: 'movie', labelKey: 'common:media.movie_plural', color: 'hsl(var(--chart-2))' },
-  { group: 'show', labelKey: 'common:media.tvShows', color: 'hsl(var(--chart-4))' },
-  { group: 'live', labelKey: 'common:media.liveTV', color: 'hsl(var(--chart-3))' },
-  { group: 'music', labelKey: 'common:media.music', color: 'hsl(var(--chart-5))' },
+  { group: 'movie', labelKey: 'common:media.movie_plural', color: MEDIA_TYPE_COLORS.movie },
+  { group: 'show', labelKey: 'common:media.tvShows', color: MEDIA_TYPE_COLORS.show },
+  { group: 'live', labelKey: 'common:media.liveTV', color: 'oklch(var(--chart-3))' },
+  { group: 'music', labelKey: 'common:media.music', color: MEDIA_TYPE_COLORS.music },
 ] as const satisfies readonly { group: PlaysMediaGroup; labelKey: string; color: string }[];
 
 export interface MediaGroupSeries {
@@ -60,7 +89,7 @@ export interface MediaGroupSeries {
 }
 
 /**
- * One series per media group in movie, show, music order, summed across servers at each x and
+ * One series per media group in movie, show, live, music order, summed across servers at each x and
  * zero-filled over every x the rows carry. A group with no plays at any x is left out.
  */
 export function buildMediaGroupSeries<T extends { mediaType?: PlaysMediaGroup; count: number }>(

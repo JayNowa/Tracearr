@@ -1,8 +1,9 @@
 /**
- * Server management routes - CRUD for Plex/Jellyfin/Emby servers
+ * Server management routes - CRUD for Plex/Jellyfin/Emby/tofa servers
  */
 
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
+import { APIError } from 'better-auth/api';
 import { eq, inArray, and, isNull } from 'drizzle-orm';
 import {
   createServerSchema,
@@ -12,31 +13,41 @@ import {
   pickServerColor,
   setServerHistoricalSchema,
   PUBLIC_URL_PLEX_MESSAGE,
+  SERVER_PROFILES,
+  assertNever,
   type ServerConnectionStatus,
   type ServerDownReason,
 } from '@tracearr/shared';
 import { db } from '../db/client.js';
 import { servers, plexAccounts, serverUsers, users } from '../db/schema.js';
-import { nonOwnerMayLoginThrough } from '../lib/authGuards.js';
+import {
+  assertOwnerKeepsALoginAfter,
+  nonOwnerMayLoginThrough,
+  type ServerAccountChange,
+} from '../lib/authGuards.js';
 import { revokeUnlessStillIn } from '../lib/revoke.js';
 import {
   PlexClient,
   JellyfinClient,
-  EmbyClient,
+  TofaClient,
   DispatcharrClient,
+  verifyServerAdmin,
 } from '../services/mediaServer/index.js';
+import { readServerFacts } from '../services/mediaServer/byServerType.js';
 import { getServerLiveStats, getServerResourceStats } from '../services/serverLiveStats.js';
+import { createServer, startAddedServer } from '../services/serverCreate.js';
+import { deleteServer } from '../services/serverDelete.js';
 import { syncServer } from '../services/sync.js';
 import { sseManager } from '../services/sseManager.js';
 import { getCacheService } from '../services/cache.js';
-import { supportsMediaLibrary } from '@tracearr/shared';
 import { markServerHistorical, resumeServer } from '../services/historicalServers.js';
 import { liveServerCondition, HISTORICAL_EDIT_MESSAGE } from '../services/liveServers.js';
-import { enqueueLibrarySync, rebuildAutoSyncSchedules } from '../jobs/librarySyncQueue.js';
+import { enqueueLibrarySync } from '../jobs/librarySyncQueue.js';
 import { installedVersionOf } from '../jobs/serverUpdateChecker.js';
 import { publishServersChanged } from '../jobs/poller/database.js';
+import { followServerOnBuiltInRequestService } from '../services/requests/store.js';
 import { readServerIdentity, sharesKnownUsers } from '../services/serverIdentity.js';
-import { getSetting, rearmImportedHistoryLink } from '../services/settings.js';
+import { getSetting } from '../services/settings.js';
 import { buildServerAccessCondition, hasServerAccess } from '../utils/serverFiltering.js';
 import { serverOrderBy } from '../utils/serverOrder.js';
 
@@ -44,6 +55,8 @@ function getDispatcharrAuthMode(token?: string | null): 'token' | 'credentials' 
   return token && DispatcharrClient.isCredentialToken(token) ? 'credentials' : 'token';
 }
 
+// Dispatcharr signs in with an API key or JWT token, or with a username and password that is
+// stored as an encoded credential token. Every other server type passes its token through.
 function normalizeDispatcharrAuth(input: {
   type: string;
   token?: string;
@@ -57,85 +70,24 @@ function normalizeDispatcharrAuth(input: {
     : token;
 }
 
-function getFirstRow<T>(rows: T[]): T | null {
-  return rows[0] ?? null;
+async function ownerLockout(change: ServerAccountChange): Promise<string | null> {
+  try {
+    await assertOwnerKeepsALoginAfter(change);
+    return null;
+  } catch (err) {
+    if (err instanceof APIError) return err.message;
+    throw err;
+  }
 }
 
-async function verifyServerAccess(params: {
-  type: 'plex' | 'jellyfin' | 'emby' | 'dispatcharr';
-  token: string;
-  url: string;
-}): Promise<
-  | { ok: true }
-  | {
-      ok: false;
-      statusCode: number;
-      message: string;
-    }
-> {
-  const { type, token, url } = params;
-
-  if (type === 'plex') {
-    const adminCheck = await PlexClient.verifyServerAdmin(token, url);
-    if (!adminCheck.success) {
-      return {
-        ok: false,
-        statusCode: adminCheck.code === PlexClient.AdminVerifyError.CONNECTION_FAILED ? 503 : 403,
-        message: adminCheck.message,
-      };
-    }
-    return { ok: true };
+// Plex never reports INVALID_KEY, so one mapping serves all three server types.
+function replyAdminCheckFailure(reply: FastifyReply, check: { code: string; message: string }) {
+  if (check.code === JellyfinClient.AdminVerifyError.CONNECTION_FAILED) {
+    return reply.serviceUnavailable(check.message);
   }
-
-  if (type === 'jellyfin') {
-    const adminCheck = await JellyfinClient.verifyServerAdmin(token, url);
-    if (!adminCheck.success) {
-      return {
-        ok: false,
-        statusCode:
-          adminCheck.code === JellyfinClient.AdminVerifyError.CONNECTION_FAILED
-            ? 503
-            : adminCheck.code === JellyfinClient.AdminVerifyError.INVALID_KEY
-              ? 400
-              : 403,
-        message: adminCheck.message,
-      };
-    }
-    return { ok: true };
+  if (check.code === JellyfinClient.AdminVerifyError.INVALID_KEY) {
+    return reply.badRequest(check.message);
   }
-
-  if (type === 'emby') {
-    const adminCheck = await EmbyClient.verifyServerAdmin(token, url);
-    return adminCheck.success
-      ? { ok: true }
-      : {
-          ok: false,
-          statusCode:
-            adminCheck.code === EmbyClient.AdminVerifyError.CONNECTION_FAILED
-              ? 503
-              : adminCheck.code === EmbyClient.AdminVerifyError.INVALID_KEY
-                ? 400
-                : 403,
-          message: adminCheck.message,
-        };
-  }
-
-  const adminCheck = await DispatcharrClient.verifyServerAdmin(token, url);
-  return adminCheck.success
-    ? { ok: true }
-    : {
-        ok: false,
-        statusCode: 503,
-        message: adminCheck.message,
-      };
-}
-
-function replyAccessCheckFailure(
-  reply: FastifyReply,
-  check: { statusCode: number; message: string }
-) {
-  if (check.statusCode === 503) return reply.serviceUnavailable(check.message);
-  if (check.statusCode === 400) return reply.badRequest(check.message);
   return reply.forbidden(check.message);
 }
 
@@ -167,6 +119,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         latestVersion: servers.latestVersion,
         historicalAt: servers.historicalAt,
         allowMemberLogin: servers.allowMemberLogin,
+        canStopStreams: servers.canStopStreams,
         createdAt: servers.createdAt,
         updatedAt: servers.updatedAt,
       })
@@ -193,6 +146,8 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
     }
 
     if (request.scope !== 'all') {
+      // A member's server selector needs to name and color their servers, nothing about how
+      // Tracearr reaches them.
       return {
         data: serverList.map((s) => ({
           id: s.id,
@@ -206,12 +161,12 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         })),
       };
     }
+
     return {
-      data: serverList.map((server) => ({
+      data: serverList.map(({ token, ...server }) => ({
         ...server,
         dispatcharrAuthMode:
-          server.type === 'dispatcharr' ? getDispatcharrAuthMode(server.token) : undefined,
-        token: undefined,
+          server.type === 'dispatcharr' ? getDispatcharrAuthMode(token) : undefined,
       })),
     };
   });
@@ -242,122 +197,97 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
       return reply.conflict('A server with this URL already exists');
     }
 
-    // Normalize auth payload (Dispatcharr can use API key/JWT token OR username+password)
+    // Dispatcharr can use an API key/JWT token OR username+password
     const normalizedToken = normalizeDispatcharrAuth({ type, token, username, password });
-
     if (!normalizedToken) {
       return reply.badRequest('Missing authentication credentials');
     }
 
-    let accessCheck: Awaited<ReturnType<typeof verifyServerAccess>>;
+    let adminCheck: Awaited<ReturnType<typeof verifyServerAdmin>>;
     try {
-      accessCheck = await verifyServerAccess({ type, token: normalizedToken, url });
+      adminCheck = await verifyServerAdmin(type, normalizedToken, url);
     } catch (error) {
       app.log.error({ err: error }, 'Failed to verify server connection');
       return reply.badRequest('Failed to connect to server. Please verify URL and token.');
     }
-    if (!accessCheck.ok) return replyAccessCheckFailure(reply, accessCheck);
+    if (!adminCheck.success) return replyAdminCheckFailure(reply, adminCheck);
+
+    let serverFacts: Awaited<ReturnType<typeof readServerFacts>>;
+    try {
+      serverFacts = await readServerFacts(type, url, normalizedToken);
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to read server settings');
+      return reply.badRequest('Could not read the API key scopes from the server.');
+    }
 
     // For Plex servers, find the owning plex account to set plexAccountId
     let plexAccountId: string | undefined;
-    if (type === 'plex') {
-      try {
-        const accountInfo = await PlexClient.getAccountInfo(normalizedToken);
-        const matchingAccount = await db
-          .select({ id: plexAccounts.id })
-          .from(plexAccounts)
-          .where(
-            and(
-              eq(plexAccounts.userId, authUser.userId),
-              eq(plexAccounts.plexAccountId, accountInfo.id)
+    let machineIdentifier: string | null = null;
+    switch (type) {
+      case 'plex':
+        try {
+          const accountInfo = await PlexClient.getAccountInfo(normalizedToken);
+          const [matchingAccount] = await db
+            .select({ id: plexAccounts.id })
+            .from(plexAccounts)
+            .where(
+              and(
+                eq(plexAccounts.userId, authUser.userId),
+                eq(plexAccounts.plexAccountId, accountInfo.id)
+              )
             )
-          )
-          .limit(1);
-        const matchingAccountRow = getFirstRow(matchingAccount);
-        if (matchingAccountRow) plexAccountId = matchingAccountRow.id;
-      } catch {
-        // Non-fatal: server will be orphaned but auto-repair can fix it later
-        app.log.debug('Could not link Plex server to account at creation time');
-      }
+            .limit(1);
+          plexAccountId = matchingAccount?.id;
+        } catch {
+          // Non-fatal: server will be orphaned but auto-repair can fix it later
+          app.log.debug('Could not link Plex server to account at creation time');
+        }
+        break;
+      case 'tofa':
+        // Stored now, so tofa cloud's Add server already knows the server is connected.
+        try {
+          machineIdentifier = await new TofaClient({
+            url,
+            token: normalizedToken,
+          }).getServerIdentity();
+        } catch {
+          app.log.debug('Could not read the tofa server identity at creation time');
+        }
+        // tofa cloud may have connected the same server at another address
+        if (machineIdentifier) {
+          const [connected] = await db
+            .select({ id: servers.id })
+            .from(servers)
+            .where(and(eq(servers.type, type), eq(servers.machineIdentifier, machineIdentifier)))
+            .limit(1);
+          if (connected) return reply.conflict('This server is already connected');
+        }
+        break;
+      case 'jellyfin':
+      case 'emby':
+      case 'dispatcharr':
+        break;
+      default:
+        assertNever(type);
     }
 
-    // Auto-assign a color based on server type and already-used colors
-    const existingColors = await db.select({ color: servers.color }).from(servers);
-    const color = pickServerColor(
+    const { server, requestServiceIds } = await createServer({
+      name,
       type,
-      existingColors.map((s) => s.color)
-    );
-
-    // Save server with plain text token (DB is localhost-only)
-    const inserted = await db
-      .insert(servers)
-      .values({
-        name,
-        type,
-        url,
-        token: normalizedToken,
-        ignoreAnonymousStreams,
-        publicUrl: publicUrl ?? null,
-        color,
-        plexAccountId, // Links Plex servers to their owning account (undefined for non-Plex)
-      })
-      .returning({
-        id: servers.id,
-        name: servers.name,
-        type: servers.type,
-        url: servers.url,
-        token: servers.token,
-        publicUrl: servers.publicUrl,
-        ignoreAnonymousStreams: servers.ignoreAnonymousStreams,
-        color: servers.color,
-        historicalAt: servers.historicalAt,
-        createdAt: servers.createdAt,
-        updatedAt: servers.updatedAt,
-      });
-
-    const server = inserted[0];
-    if (!server) {
-      return reply.internalServerError('Failed to create server');
-    }
-
-    await publishServersChanged();
-    rebuildAutoSyncSchedules().catch((error: unknown) => {
-      app.log.error(
-        { err: error, serverId: server.id },
-        'Auto-sync schedule failed for new server'
-      );
+      url,
+      token: normalizedToken,
+      ignoreAnonymousStreams,
+      publicUrl,
+      plexAccountId,
+      machineIdentifier,
+      facts: serverFacts,
     });
-
-    if (server.type === 'plex') {
-      await rearmImportedHistoryLink({ keepProviderPass: false });
-    }
-
-    // Auto-sync users and libraries in background
-    syncServer(server.id, { syncUsers: true, syncLibraries: true })
-      .then((result) => {
-        app.log.info(
-          {
-            serverId: server.id,
-            usersAdded: result.usersAdded,
-            librariesSynced: result.librariesSynced,
-          },
-          'Auto-sync completed for new server'
-        );
-      })
-      .catch((error: unknown) => {
-        app.log.error({ err: error, serverId: server.id }, 'Auto-sync failed for new server');
-      });
-
-    // Start realtime (SSE) connection in background
-    sseManager.refresh().catch((error: unknown) => {
-      app.log.error({ err: error, serverId: server.id }, 'SSE refresh failed for new server');
-    });
+    await startAddedServer(server, requestServiceIds);
 
     return reply.status(201).send({
       ...server,
       dispatcharrAuthMode:
-        server.type === 'dispatcharr' ? getDispatcharrAuthMode(server.token) : undefined,
-      token: undefined,
+        server.type === 'dispatcharr' ? getDispatcharrAuthMode(normalizedToken) : undefined,
     });
   });
 
@@ -416,33 +346,48 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
     if (authChanged && server.type !== 'dispatcharr') {
       return reply.badRequest('Authentication updates are only supported for Dispatcharr servers');
     }
-    const effectiveUrl = newUrl ?? server.url;
-    const normalizedToken =
-      authChanged && server.type === 'dispatcharr'
-        ? normalizeDispatcharrAuth({
-            type: server.type,
-            token: newToken,
-            username: newUsername,
-            password: newPassword,
-          })
-        : (newApiKey ?? server.token);
-
-    if (authChanged && !normalizedToken) {
-      return reply.badRequest('Dispatcharr update requires a complete token or username+password');
-    }
-    const verifiedToken = normalizedToken ?? undefined;
     if (server.type === 'dispatcharr' && newApiKey !== undefined) {
       return reply.badRequest(
         'Dispatcharr authentication uses token or username+password, not apiKey'
       );
     }
-
-    if (server.type === 'plex' && newPublicUrl !== undefined) {
-      return reply.badRequest(PUBLIC_URL_PLEX_MESSAGE);
+    const normalizedToken = authChanged
+      ? normalizeDispatcharrAuth({
+          type: server.type,
+          token: newToken,
+          username: newUsername,
+          password: newPassword,
+        })
+      : undefined;
+    if (authChanged && !normalizedToken) {
+      return reply.badRequest('Dispatcharr update requires a complete token or username+password');
     }
 
-    if (server.type === 'plex' && newApiKey !== undefined) {
-      return reply.badRequest('Plex servers sign in through plex.tv and have no API key to change');
+    switch (server.type) {
+      case 'plex':
+        if (newPublicUrl !== undefined) {
+          return reply.badRequest(PUBLIC_URL_PLEX_MESSAGE);
+        }
+        if (newApiKey !== undefined) {
+          return reply.badRequest(
+            'Plex servers sign in through plex.tv and have no API key to change'
+          );
+        }
+        break;
+      case 'jellyfin':
+      case 'emby':
+      case 'tofa':
+      case 'dispatcharr':
+        break;
+      default:
+        assertNever(server.type);
+    }
+
+    const profile = SERVER_PROFILES[server.type];
+    if (newAllowMemberLogin === true && profile.memberSignIn === 'unavailable') {
+      return reply.badRequest(
+        `${profile.displayName} has no sign-in Tracearr can call, so members cannot sign in through it`
+      );
     }
 
     const same = <T>(next: T | undefined, current: T): boolean =>
@@ -466,67 +411,82 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         url: server.url,
         publicUrl: server.publicUrl,
         color: server.color,
+        ignoreAnonymousStreams: server.ignoreAnonymousStreams,
         dispatcharrAuthMode:
           server.type === 'dispatcharr' ? getDispatcharrAuthMode(server.token) : undefined,
-        ignoreAnonymousStreams: server.ignoreAnonymousStreams,
         historicalAt: server.historicalAt,
         allowMemberLogin: server.allowMemberLogin,
+        canStopStreams: server.canStopStreams,
         createdAt: server.createdAt,
         updatedAt: server.updatedAt,
       };
     }
 
     const urlChanging = newUrl !== undefined && server.url !== newUrl;
-    const keyChanging = newApiKey !== undefined && server.token !== newApiKey;
+    const keyChanging = authChanged || (newApiKey !== undefined && server.token !== newApiKey);
     if (server.historicalAt && (urlChanging || keyChanging)) {
       return reply.conflict(HISTORICAL_EDIT_MESSAGE);
     }
+    const targetUrl = newUrl ?? server.url;
+    const token = normalizedToken ?? newApiKey ?? server.token;
 
     let backfilledIdentity: string | undefined;
+    let serverFacts: Awaited<ReturnType<typeof readServerFacts>> = {};
 
-    if (urlChanging || keyChanging || authChanged) {
-      if (
-        server.type === 'plex' &&
-        clientIdentifier &&
-        server.machineIdentifier &&
-        server.machineIdentifier !== clientIdentifier
-      ) {
-        return reply.badRequest(
-          'Server mismatch: The selected connection belongs to a different server. ' +
-            'Please select a connection for the correct server.'
-        );
+    if (urlChanging || keyChanging) {
+      // For Plex servers: Validate machineIdentifier if provided
+      switch (server.type) {
+        case 'plex':
+          if (
+            clientIdentifier &&
+            server.machineIdentifier &&
+            server.machineIdentifier !== clientIdentifier
+          ) {
+            return reply.badRequest(
+              'Server mismatch: The selected connection belongs to a different server. ' +
+                'Please select a connection for the correct server.'
+            );
+          }
+          break;
+        case 'jellyfin':
+        case 'emby':
+        case 'tofa':
+        case 'dispatcharr':
+          break;
+        default:
+          assertNever(server.type);
       }
-      let accessCheck: Awaited<ReturnType<typeof verifyServerAccess>>;
+
+      let adminCheck: Awaited<ReturnType<typeof verifyServerAdmin>>;
       try {
-        accessCheck = await verifyServerAccess({
-          type: server.type,
-          token: verifiedToken as string,
-          url: effectiveUrl,
-        });
+        adminCheck = await verifyServerAdmin(server.type, token, targetUrl);
       } catch (error) {
-        app.log.error(
-          { err: error, serverId: id, newUrl: effectiveUrl },
-          'Failed to verify updated server configuration'
-        );
+        app.log.error({ err: error, serverId: id, url: targetUrl }, 'Failed to verify server');
         return reply.badRequest(
-          'Failed to connect to server with updated configuration. Please verify the settings.'
+          'Failed to connect to the server. Please verify the URL and API key are correct.'
         );
       }
+      if (!adminCheck.success) return replyAdminCheckFailure(reply, adminCheck);
 
-      if (!accessCheck.ok) return replyAccessCheckFailure(reply, accessCheck);
-
-      // Dispatcharr does not expose a stable server identity; retain its verified auth flow.
-      if (server.type !== 'dispatcharr') {
+      // Dispatcharr does not expose a stable server identity; its verified auth flow stands in.
+      if (server.type === 'dispatcharr') {
+        try {
+          serverFacts = await readServerFacts(server.type, targetUrl, token);
+        } catch (error) {
+          app.log.error(
+            { err: error, serverId: id, url: targetUrl },
+            'Failed to read server settings'
+          );
+          return reply.badRequest('Could not read the settings from the server.');
+        }
+      } else {
+        const target = { id, type: server.type, url: targetUrl, token };
         const expectedIdentity =
           server.machineIdentifier ?? (await readServerIdentity(server).catch(() => null));
-        const reachedIdentity = await readServerIdentity({
-          id,
-          type: server.type,
-          url: effectiveUrl,
-          token: verifiedToken as string,
-        }).catch((error: unknown) => {
+
+        const reachedIdentity = await readServerIdentity(target).catch((error: unknown) => {
           app.log.error(
-            { err: error, serverId: id, url: effectiveUrl },
+            { err: error, serverId: id, url: targetUrl },
             'Failed to read server identity'
           );
           return null;
@@ -534,6 +494,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         if (reachedIdentity === null) {
           return reply.badRequest('Could not read which server answers at that address.');
         }
+
         if (expectedIdentity) {
           if (reachedIdentity !== expectedIdentity) {
             return reply.badRequest(
@@ -541,16 +502,8 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
             );
           }
         } else {
-          const sameUsers = await sharesKnownUsers({
-            id,
-            type: server.type,
-            url: effectiveUrl,
-            token: verifiedToken as string,
-          }).catch((error: unknown) => {
-            app.log.error(
-              { err: error, serverId: id, url: effectiveUrl },
-              'Failed to compare users'
-            );
+          const sameUsers = await sharesKnownUsers(target).catch((error: unknown) => {
+            app.log.error({ err: error, serverId: id, url: targetUrl }, 'Failed to compare users');
             return false;
           });
           if (!sameUsers) {
@@ -560,38 +513,46 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
           }
         }
         if (!server.machineIdentifier) backfilledIdentity = reachedIdentity;
+
+        try {
+          serverFacts = await readServerFacts(server.type, targetUrl, token);
+        } catch (error) {
+          app.log.error(
+            { err: error, serverId: id, url: targetUrl },
+            'Failed to read server settings'
+          );
+          return reply.badRequest('Could not read the API key scopes from the server.');
+        }
       }
     }
 
-    // Build update object
     const updatePayload: {
       name?: string;
       url?: string;
-      token?: string;
-      ignoreAnonymousStreams?: boolean;
       color?: string | null;
       publicUrl?: string | null;
+      token?: string;
+      ignoreAnonymousStreams?: boolean;
       machineIdentifier?: string;
       allowMemberLogin?: boolean;
+      canStopStreams?: boolean;
+      watchedRulePercent?: number | null;
       updatedAt: Date;
-    } = { updatedAt: new Date() };
+    } = { ...serverFacts, updatedAt: new Date() };
     if (backfilledIdentity !== undefined) updatePayload.machineIdentifier = backfilledIdentity;
     if (newName !== undefined) updatePayload.name = newName;
     if (newUrl !== undefined) updatePayload.url = newUrl;
+    if (newColor !== undefined) updatePayload.color = newColor;
+    if (newPublicUrl !== undefined) updatePayload.publicUrl = newPublicUrl;
     if (authChanged) updatePayload.token = normalizedToken;
     if (newIgnoreAnonymousStreams !== undefined) {
       updatePayload.ignoreAnonymousStreams = newIgnoreAnonymousStreams;
     }
-    if (newColor !== undefined) updatePayload.color = newColor;
-    if (newPublicUrl !== undefined) updatePayload.publicUrl = newPublicUrl;
     if (newApiKey !== undefined) updatePayload.token = newApiKey;
     if (newAllowMemberLogin !== undefined) updatePayload.allowMemberLogin = newAllowMemberLogin;
 
-    const updated = await db
-      .update(servers)
-      .set(updatePayload)
-      .where(eq(servers.id, id))
-      .returning({
+    const updated = await db.transaction(async (tx) => {
+      const rows = await tx.update(servers).set(updatePayload).where(eq(servers.id, id)).returning({
         id: servers.id,
         name: servers.name,
         type: servers.type,
@@ -602,22 +563,24 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         color: servers.color,
         historicalAt: servers.historicalAt,
         allowMemberLogin: servers.allowMemberLogin,
+        canStopStreams: servers.canStopStreams,
         createdAt: servers.createdAt,
         updatedAt: servers.updatedAt,
       });
+      if (
+        SERVER_PROFILES[server.type].builtInRequests !== null &&
+        (newName !== undefined || newUrl !== undefined)
+      ) {
+        await followServerOnBuiltInRequestService(tx, id);
+      }
+      return rows;
+    });
 
     const result = updated[0];
     if (!result) {
       return reply.internalServerError('Failed to update server');
     }
 
-    const connectorConfigChanged =
-      (newName !== undefined && newName !== server.name) ||
-      (newUrl !== undefined && newUrl !== server.url) ||
-      authChanged ||
-      keyChanging ||
-      (newIgnoreAnonymousStreams !== undefined &&
-        newIgnoreAnonymousStreams !== server.ignoreAnonymousStreams);
     if (newAllowMemberLogin === false) {
       const [accounts, { member }] = await Promise.all([
         db
@@ -643,32 +606,33 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
 
     await publishServersChanged();
 
-    if (connectorConfigChanged) {
-      if (newUrl !== undefined) {
-        app.log.info({ serverId: id, oldUrl: server.url, newUrl }, 'Server URL updated');
-      }
-      if (authChanged || keyChanging) {
-        app.log.info({ serverId: id }, 'Server authentication updated');
-      }
-      // The leader compares connector-owned fields with the database row and
-      // replaces stale connections. Followers safely no-op here and converge
-      // on the leader's next reconciliation tick.
-      sseManager.refresh().catch((error: unknown) => {
-        app.log.error(
-          { err: error, serverId: id },
-          'SSE refresh failed after server configuration update'
-        );
-      });
+    const ignoreAnonymousStreamsChanged =
+      newIgnoreAnonymousStreams !== undefined &&
+      newIgnoreAnonymousStreams !== server.ignoreAnonymousStreams;
+    if (newUrl !== undefined || keyChanging || ignoreAnonymousStreamsChanged) {
+      // The live connection holds the old address, credentials and filter; drop it and re-add
+      sseManager
+        .removeServer(id)
+        .then(() => sseManager.refresh())
+        .catch((error: unknown) => {
+          app.log.error({ err: error, serverId: id }, 'SSE refresh failed after server update');
+        });
+    }
+    if (newUrl !== undefined) {
+      app.log.info({ serverId: id, oldUrl: server.url, newUrl }, 'Server URL updated');
+    }
+    if (keyChanging) {
+      app.log.info({ serverId: id }, 'Server API key updated');
     }
     if (newName !== undefined) {
       app.log.info({ serverId: id, oldName: server.name, newName }, 'Server name updated');
     }
 
+    const { token: updatedToken, ...publicResult } = result;
     return {
-      ...result,
+      ...publicResult,
       dispatcharrAuthMode:
-        result.type === 'dispatcharr' ? getDispatcharrAuthMode(result.token) : undefined,
-      token: undefined,
+        result.type === 'dispatcharr' ? getDispatcharrAuthMode(updatedToken) : undefined,
     };
   });
 
@@ -758,15 +722,10 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
       return reply.notFound('Server not found');
     }
 
-    // Delete server (cascade will handle related records)
-    await db.delete(servers).where(eq(servers.id, id));
-    await publishServersChanged();
+    const lockout = await ownerLockout({ kind: 'deleteServer', serverId: id });
+    if (lockout) return reply.badRequest(lockout);
 
-    // Tear down the server's SSE connection in background
-    sseManager.refresh().catch((error: unknown) => {
-      app.log.error({ err: error, serverId: id }, 'SSE refresh failed after server delete');
-    });
-
+    await deleteServer(id);
     return { success: true };
   });
 
@@ -810,20 +769,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
       // Also trigger full library sync (items/episodes) in background
       let librarySyncJobId: string | null = null;
       try {
-        if (!supportsMediaLibrary(server.type)) {
-          return {
-            success: result.errors.length === 0,
-            usersAdded: result.usersAdded,
-            usersUpdated: result.usersUpdated,
-            usersRemoved: result.usersRemoved,
-            usersRestored: result.usersRestored,
-            librariesSynced: 0,
-            librarySyncJobId: null,
-            errors: result.errors,
-            syncedAt: new Date().toISOString(),
-          };
-        }
-        librarySyncJobId = await enqueueLibrarySync(id, 'manual', authUser.userId);
+        librarySyncJobId = await enqueueLibrarySync(id, 'manual', { userId: authUser.userId });
         app.log.info({ serverId: id, jobId: librarySyncJobId }, 'Library sync job enqueued');
       } catch (err) {
         // Don't fail the whole sync if library sync can't be queued
@@ -870,6 +816,11 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
     const [server] = await db.select().from(servers).where(eq(servers.id, params.data.id)).limit(1);
     if (!server) {
       return reply.notFound('Server not found');
+    }
+
+    if (body.data.historical) {
+      const lockout = await ownerLockout({ kind: 'retireServer', serverId: server.id });
+      if (lockout) return reply.badRequest(lockout);
     }
 
     const updated = body.data.historical
@@ -919,7 +870,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // Reads Plex's own statistics endpoint; Jellyfin and Emby are served by /live-stats
-    if (server.type !== 'plex') {
+    if (SERVER_PROFILES[server.type].hostStats !== 'plexStatistics') {
       return reply.badRequest('Server statistics are only available for Plex servers');
     }
 
@@ -1035,7 +986,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
    * GET /servers/connection-status - Live SSE plugin connection state per server
    *
    * Returns per-server realtime/polling mode. Status is ephemeral runtime truth
-   * mirrored in Redis with a TTL — not persisted to the database. Servers with
+   * mirrored in Redis with a TTL, not persisted to the database. Servers with
    * no cached status are reported as polling (safe default).
    */
   app.get('/connection-status', readServers, async (request) => {
@@ -1062,7 +1013,7 @@ export const serverRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // No cached status yet — default to polling (safe)
+      // No cached status yet, so default to polling (safe)
       result.push({
         serverId: server.id,
         serverName: server.name,

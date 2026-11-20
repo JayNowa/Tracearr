@@ -7,7 +7,10 @@ import type {
   MediaServerConfig,
   MediaSession,
   MediaUser,
+  DownloadSourceDescription,
+  NotNeeded,
 } from '../types.js';
+import { NOT_NEEDED } from '../types.js';
 import {
   type DispatcharrResolvedOutputProfile,
   normalizeDispatcharrChannel,
@@ -509,6 +512,70 @@ export class DispatcharrClient implements IMediaServerClient {
 
   async getLibraryItems(): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
     return { items: [], totalCount: 0 };
+  }
+
+  // Dispatcharr is a live TV source with no media library or download history, so the library
+  // and download parts of the client contract have nothing to report.
+
+  async getServerIdentity(): Promise<string | null> {
+    return null;
+  }
+
+  async getSoftwareVersion(): Promise<string | null> {
+    return null;
+  }
+
+  async describeDownloadSource(): Promise<DownloadSourceDescription> {
+    return {
+      version: null,
+      delivered: null,
+      device: { deviceId: null, playerName: null, product: null, platform: null },
+      ipAddress: null,
+    };
+  }
+
+  async findExistingRatingKeys(): Promise<Set<string>> {
+    return new Set();
+  }
+
+  async getLibraryLeaves(): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
+    return { items: [], totalCount: 0 };
+  }
+
+  async getLibraryItemsSince(): Promise<{
+    items: MediaLibraryItem[];
+    totalCount: number;
+    feed: NotNeeded;
+  }> {
+    return { items: [], totalCount: 0, feed: NOT_NEEDED };
+  }
+
+  async getLibraryLeavesSince(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async getLibraryRevision(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async getLibrarySeasons(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async getLibrarySeasonsSince(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async getLibraryAlbums(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async getLibraryAlbumsSince(): Promise<NotNeeded> {
+    return NOT_NEEDED;
+  }
+
+  async checkFilesExist(): Promise<NotNeeded> {
+    return NOT_NEEDED;
   }
 
   static async verifyServerAdmin(

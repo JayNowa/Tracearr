@@ -34,7 +34,8 @@ export const ErrorCodes = {
   JELLYFIN_ERROR: 'EXT_002',
   GEOIP_ERROR: 'EXT_003',
   EMBY_ERROR: 'EXT_004',
-  DISPATCHARR_ERROR: 'EXT_005',
+  TOFA_ERROR: 'EXT_005',
+  DISPATCHARR_ERROR: 'EXT_006',
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];

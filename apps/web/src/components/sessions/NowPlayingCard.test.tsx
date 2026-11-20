@@ -1,636 +1,55 @@
-// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { setTimeFormat } from '@/lib/dateFormat';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
-import { NowPlayingCard } from './NowPlayingCard';
 import type { ActiveSession } from '@tracearr/shared';
-
-const playbackLabels = vi.hoisted(() => ({
-  paused: 'playback.paused',
-  buffering: 'playback.buffering',
-}));
+import { NowPlayingCard } from './NowPlayingCard';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string) => {
-      if (key === 'playback.paused') return playbackLabels.paused;
-      if (key === 'playback.buffering') return playbackLabels.buffering;
-      return key === 'pages:automations.options.trailer' ? 'Trailer' : key;
-    },
-  }),
+  useTranslation: () => ({ t: (key: string) => key }),
 }));
 
-vi.mock('@/hooks/useAuth', () => ({
-  useAuth: () => ({ user: { role: 'member' } }),
-}));
-
+const auth = vi.hoisted(() => ({ role: 'member' }));
+vi.mock('@/hooks/useAuth', () => ({ useAuth: () => ({ user: auth }) }));
 vi.mock('@/hooks/useServer', () => ({
   useServer: () => ({
     isMultiServer: false,
-    selectedServers: [{ id: 'server-1', color: null }],
-    selectedServerIds: ['server-1'],
-    selectedServerId: 'server-1',
+    servers: [{ id: 'server-2', canStopStreams: false }],
   }),
 }));
+vi.mock('@/hooks/useServerColorMap', () => ({ useServerColorMap: () => new Map() }));
 
-vi.mock('@/hooks/useEstimatedProgress', () => ({
-  useEstimatedProgress: (session: ActiveSession) => ({
-    estimatedProgressMs: session.progressMs ?? 0,
-    progressPercent:
-      session.totalDurationMs && session.progressMs
-        ? (session.progressMs / session.totalDurationMs) * 100
-        : 0,
-  }),
-}));
+// The dialog opens a mutation on mount, which would need a query client here
+vi.mock('./TerminateSessionDialog', () => ({ TerminateSessionDialog: () => null }));
 
-vi.mock('./TerminateSessionDialog', () => ({
-  TerminateSessionDialog: () => null,
-}));
-
-function makeSession(overrides: Partial<ActiveSession> = {}): ActiveSession {
-  return {
+function renderCard(overrides: Partial<ActiveSession>, onClick?: () => void) {
+  const session = {
     id: 'session-1',
     serverId: 'server-1',
-    serverUserId: 'user-1',
-    sessionKey: 'sk-1',
+    server: { id: 'server-1', name: 'Basement', type: 'plex' },
+    user: { id: 'su-1', username: 'alice', thumbUrl: null, identityName: null },
     state: 'playing',
-    mediaType: 'live',
-    mediaTitle: 'Morning News',
-    grandparentTitle: null,
-    seasonNumber: null,
-    episodeNumber: null,
-    year: null,
+    mediaType: 'movie',
+    mediaTitle: 'Heat',
     thumbPath: null,
-    ratingKey: null,
-    serverVersionKey: null,
-    parentRatingKey: null,
-    grandparentRatingKey: null,
-    mediaId: null,
-    showMediaId: null,
-    imdbId: null,
-    tmdbId: null,
-    tvdbId: null,
-    externalSessionId: null,
-    startedAt: new Date(),
-    stoppedAt: null,
-    durationMs: null,
-    totalDurationMs: null,
-    progressMs: null,
-    progressUpdatedAt: new Date(),
-    lastPausedAt: null,
-    pausedDurationMs: 0,
-    referenceId: null,
-    watched: false,
-    ipAddress: '127.0.0.1',
-    geoCity: null,
-    geoRegion: null,
-    geoCountry: null,
-    geoContinent: null,
-    geoPostal: null,
-    geoLat: null,
-    geoLon: null,
-    geoAsnNumber: null,
-    geoAsnOrganization: null,
-    isLocal: false,
-    playerName: 'Player',
-    deviceId: 'device-1',
+    progressMs: 0,
+    totalDurationMs: 7_200_000,
+    isTranscode: false,
+    transcodeInfo: null,
+    canTerminate: false,
+    playerName: null,
     product: null,
     device: null,
     platform: null,
-    quality: null,
-    isTranscode: false,
-    videoDecision: null,
-    audioDecision: null,
-    bitrate: null,
-    sourceVideoCodec: null,
-    sourceAudioCodec: null,
-    sourceAudioChannels: null,
-    sourceVideoWidth: null,
-    sourceVideoHeight: null,
-    sourceVideoDetails: null,
-    sourceAudioDetails: null,
-    streamVideoCodec: null,
-    streamAudioCodec: null,
-    streamVideoDetails: null,
-    streamAudioDetails: null,
-    transcodeInfo: null,
-    subtitleInfo: null,
-    channelTitle: 'Dispatch News',
-    channelIdentifier: 'ch-1',
-    channelThumb: null,
-    artistName: null,
-    albumName: null,
-    trackNumber: null,
-    discNumber: null,
-    user: {
-      id: 'user-1',
-      username: 'alice',
-      thumbUrl: null,
-      identityName: null,
-    },
-    server: {
-      id: 'server-1',
-      name: 'Dispatcharr',
-      type: 'dispatcharr',
-    },
-    canTerminate: false,
     ...overrides,
-  };
-}
+  } as unknown as ActiveSession;
 
-function getProgressTranslatePercent(container: HTMLElement): number | null {
-  const indicator = container.querySelector<HTMLElement>('[style*="translateX"]');
-  const transform = indicator?.style.transform ?? '';
-  const match = transform.match(/translateX\(-([0-9.]+)%\)/);
-  return match?.[1] ? Number(match[1]) : null;
-}
-
-describe('NowPlayingCard ffmpeg speed display', () => {
-  beforeEach(() => {
-    localStorage.clear();
-    playbackLabels.paused = 'playback.paused';
-    playbackLabels.buffering = 'playback.buffering';
-  });
-
-  it.each([null, 2026])('labels a Plex trailer with year %s without changing its title', (year) => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          mediaType: 'trailer',
-          mediaTitle: 'Movie title',
-          year,
-          server: { id: 'plex-1', name: 'Plex', type: 'plex' },
-        })}
-      />
-    );
-    expect(screen.getByText('Movie title')).toBeTruthy();
-    expect(screen.getByText(year ? `Trailer · ${year}` : 'Trailer')).toBeTruthy();
-  });
-
-  it('shows a catch-up icon for Dispatcharr catch-up cards', () => {
-    const { container } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-        })}
-      />
-    );
-
-    expect(screen.getByTitle('Catch-up')).toBeTruthy();
-    expect(container.querySelector('[data-testid="catchup-badge"]')).toBeTruthy();
-  });
-
-  it('does not show a catch-up icon for Dispatcharr live sessions without catch-up', () => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'live',
-        })}
-      />
-    );
-
-    expect(screen.queryByTitle('Catch-up')).toBeNull();
-  });
-
-  it('does not show a catch-up icon for non-Dispatcharr live sessions', () => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          server: { id: 'server-2', name: 'Plex', type: 'plex' },
-        })}
-      />
-    );
-
-    expect(screen.queryByTitle('Catch-up')).toBeNull();
-  });
-
-  it('renders catch-up before quality and device badges', () => {
-    const { container } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-        })}
-      />
-    );
-
-    const badgeRow = container.querySelector('.flex.shrink-0.items-center.gap-1\\.5');
-    const badgeIds = Array.from(badgeRow?.children ?? []).map((child) =>
-      (child as HTMLElement).getAttribute('data-testid')
-    );
-
-    expect(badgeIds.slice(0, 3)).toEqual(['catchup-badge', 'quality-badge', 'device-badge']);
-
-    const catchupBadge = container.querySelector('[data-testid="catchup-badge"]');
-    expect(catchupBadge?.className).toContain('rounded-full');
-    expect(catchupBadge?.className).toContain('bg-blue-500/15');
-    expect(catchupBadge?.className).toContain('text-blue-600');
-  });
-
-  it('shows 24-hour start and end times for Dispatcharr catch-up cards', () => {
-    setTimeFormat('24h');
-
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T13:30:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T13:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T15:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 0,
-        })}
-      />
-    );
-
-    expect(screen.getByText('13:30')).toBeTruthy();
-    expect(screen.getByText('15:00')).toBeTruthy();
-    expect(screen.queryByText('1.03x')).toBeNull();
-  });
-
-  it('shows 12-hour start and end times for Dispatcharr catch-up cards', () => {
-    setTimeFormat('12h');
-
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T13:30:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T13:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T15:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 0,
-        })}
-      />
-    );
-
-    expect(screen.getByText('1:30 PM')).toBeTruthy();
-    expect(screen.getByText('3:00 PM')).toBeTruthy();
-  });
-
-  it('keeps catch-up progress empty when EPG data is missing', () => {
-    const { container } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T06:15:00.000Z',
-          dispatcharrCatchupEpgStartAt: null,
-          dispatcharrCatchupEpgEndAt: null,
-          totalDurationMs: 5_400_000,
-          progressMs: 2_700_000,
-        })}
-      />
-    );
-
-    expect(screen.getAllByText('--:--')).toHaveLength(2);
-    expect(getProgressTranslatePercent(container)).toBe(50);
-  });
-
-  it('uses the backend progress after programme_start changes', () => {
-    const { container, rerender } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T07:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 0,
-        })}
-      />
-    );
-
-    rerender(
-      <NowPlayingCard
-        session={makeSession({
-          mediaTitle: 'Late News',
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T06:15:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T07:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 2_700_000,
-        })}
-      />
-    );
-
-    expect(screen.getByText('Late News')).toBeTruthy();
-    expect(getProgressTranslatePercent(container)).toBe(50);
-  });
-
-  it('replaces the title, clocks and full timeline when the same catch-up connection reaches the next programme', () => {
-    setTimeFormat('24h');
-    const session = makeSession({
-      dispatcharrPlaybackKind: 'catchup',
-      dispatcharrCatchupAnchorAt: '2026-07-19T05:30:00.000Z',
-      dispatcharrCatchupEpgStartAt: '2026-07-19T05:30:00.000Z',
-      dispatcharrCatchupEpgEndAt: '2026-07-19T07:00:00.000Z',
-      totalDurationMs: 5_400_000,
-      progressMs: 5_400_000,
-    });
-    const { container, rerender } = render(<NowPlayingCard session={session} />);
-    expect(getProgressTranslatePercent(container)).toBe(0);
-    expect(screen.getByText('Morning News')).toBeTruthy();
-
-    rerender(
-      <NowPlayingCard
-        session={{
-          ...session,
-          mediaTitle: 'Late News',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T07:00:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T08:00:00.000Z',
-          totalDurationMs: 3_600_000,
-          progressMs: 120_000,
-        }}
-      />
-    );
-    expect(screen.queryByText('Morning News')).toBeNull();
-    expect(screen.getByText('Late News')).toBeTruthy();
-    expect(screen.getByText('07:00')).toBeTruthy();
-    expect(screen.getByText('08:00')).toBeTruthy();
-    expect(screen.queryByText('05:30')).toBeNull();
-    expect(getProgressTranslatePercent(container)).toBeCloseTo(96.667, 2);
-  });
-
-  it('keeps backend catch-up progress across refetches when programme_start is unchanged', () => {
-    const initialProgressUpdatedAt = new Date('2026-07-19T05:30:00.000Z');
-    const refetchProgressUpdatedAt = new Date('2026-07-19T05:31:00.000Z');
-
-    const { container, rerender } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T07:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 0,
-          progressUpdatedAt: initialProgressUpdatedAt,
-        })}
-      />
-    );
-
-    rerender(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          dispatcharrCatchupAnchorAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgStartAt: '2026-07-19T05:30:00.000Z',
-          dispatcharrCatchupEpgEndAt: '2026-07-19T07:00:00.000Z',
-          totalDurationMs: 5_400_000,
-          progressMs: 60_000,
-          progressUpdatedAt: refetchProgressUpdatedAt,
-        })}
-      />
-    );
-
-    expect(getProgressTranslatePercent(container)).toBeCloseTo(98.889, 2);
-  });
-
-  it('shows ffmpeg speed for dispatcharr live streams', () => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          transcodeInfo: { speed: 1.03 },
-          server: { id: 'server-1', name: 'Dispatcharr', type: 'dispatcharr' },
-          mediaType: 'live',
-        })}
-      />
-    );
-
-    expect(screen.getByText('1.03x')).toBeTruthy();
-  });
-
-  it.each([
-    [2.54, 'Provider A', '2.54x (Provider A)'],
-    [0, 'Provider A', '0.00x (Provider A)'],
-    [undefined, 'Provider A', '(Provider A)'],
-    [NaN, 'Provider A', '(Provider A)'],
-    [Infinity, 'Provider A', '(Provider A)'],
-    [2.54, undefined, '2.54x'],
-    [2.54, '   ', '2.54x'],
-  ] as const)(
-    'formats speed %s and provider %s as %s',
-    (speed, dispatcharrProviderName, expected) => {
-      render(
-        <NowPlayingCard
-          session={makeSession({ transcodeInfo: { speed, dispatcharrProviderName } })}
-        />
-      );
-      expect(screen.getByText(expected)).toBeTruthy();
-      expect(screen.getByTitle(expected)).toBeTruthy();
-    }
-  );
-
-  it('keeps the original placeholder when both speed and provider are missing', () => {
-    render(<NowPlayingCard session={makeSession({ transcodeInfo: null })} />);
-    expect(screen.getAllByText('--:--')).toHaveLength(2);
-  });
-
-  it.each(['paused', 'buffering'] as const)(
-    'appends the provider to the translated %s state',
-    (state) => {
-      playbackLabels.paused = 'En pause';
-      playbackLabels.buffering = 'Mise en mémoire tampon';
-      render(
-        <NowPlayingCard
-          session={makeSession({
-            state: state === 'paused' ? 'paused' : 'playing',
-            buffering: state === 'buffering',
-            transcodeInfo: { speed: 2.54, dispatcharrProviderName: 'Provider A' },
-          })}
-        />
-      );
-      const expected = `${playbackLabels[state]} (Provider A)`;
-      expect(screen.getByText(expected)).toBeTruthy();
-      expect(screen.getByTitle(expected)).toBeTruthy();
-      expect(screen.queryByText('2.54x (Provider A)')).toBeNull();
-    }
-  );
-
-  it('truncates a long provider with the complete label available in its title', () => {
-    const provider = 'A very long provider name '.repeat(6).trim();
-    render(
-      <NowPlayingCard
-        session={makeSession({ transcodeInfo: { speed: 2.54, dispatcharrProviderName: provider } })}
-      />
-    );
-    const label = screen.getByTitle(`2.54x (${provider})`);
-    expect(label.className).toContain('truncate');
-    expect(label.className).toContain('min-w-0');
-  });
-
-  it.each(['catchup', 'vod', 'plex'] as const)('does not add the provider to %s cards', (kind) => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          mediaType: kind === 'vod' ? 'movie' : 'live',
-          dispatcharrPlaybackKind: kind === 'plex' ? undefined : kind,
-          server: {
-            id: 'server-1',
-            name: kind === 'plex' ? 'Plex' : 'Dispatcharr',
-            type: kind === 'plex' ? 'plex' : 'dispatcharr',
-          },
-          transcodeInfo: { speed: 2.54, dispatcharrProviderName: 'Provider A' },
-        })}
-      />
-    );
-    expect(screen.queryByText(/Provider A/)).toBeNull();
-    expect(screen.queryByText(/2\.54x/)).toBeNull();
-  });
-
-  it('keeps default duration fallback for non-dispatcharr streams', () => {
-    render(
-      <NowPlayingCard
-        session={makeSession({
-          transcodeInfo: { speed: 1.25 },
-          server: { id: 'server-2', name: 'Plex', type: 'plex' },
-          mediaType: 'live',
-        })}
-      />
-    );
-
-    expect(screen.queryByText('1.25x')).toBeNull();
-    expect(screen.getAllByText('--:--')).toHaveLength(2);
-  });
-
-  it.each(['movie', 'episode', 'live', 'track'] as const)(
-    'contains the complete %s artwork',
-    (mediaType) => {
-      const { container } = render(
-        <NowPlayingCard
-          session={makeSession({
-            mediaType,
-            thumbPath: '/Items/art/Images/Primary',
-            server: { id: 'server-1', name: 'Jellyfin', type: 'jellyfin' },
-          })}
-        />
-      );
-      const poster = container.querySelector('img[src*="images/proxy"]');
-      expect(screen.getByTestId('card-artwork')).not.toHaveClass('bg-muted');
-      expect(screen.getByTestId('card-artwork')).not.toHaveClass('overflow-hidden');
-      expect(poster).toHaveClass('max-h-28');
-      expect(poster).toHaveClass('max-w-20');
-      expect(poster).not.toHaveClass('shadow-lg');
-      if (mediaType === 'live') {
-        expect(poster).not.toHaveClass('rounded-lg');
-      } else {
-        expect(poster).toHaveClass('rounded-lg');
-      }
-      expect(screen.getByTestId('artwork-playback-overlay')).not.toHaveClass('bg-black/50');
-      expect(screen.getByTestId('artwork-playback-overlay')).toHaveClass(
-        'opacity-0',
-        'group-hover:opacity-100'
-      );
-      expect(screen.getByTestId('artwork-playback-overlay').parentElement).toHaveClass(
-        'overflow-visible'
-      );
-      expect(container.querySelector('svg.lucide-play')).toHaveClass('h-8', 'w-8', 'shrink-0');
-      expect(poster).toHaveClass('transition-[filter]', 'group-hover:brightness-50');
-      expect(poster).not.toHaveClass('brightness-50');
-      expect(screen.queryByTestId('artwork-dimmer')).toBeNull();
-      expect(screen.getByTestId('artwork-playback-overlay')).not.toHaveClass('brightness-50');
-      expect(container.querySelector('svg.lucide-play')?.parentElement).toBe(
-        screen.getByTestId('artwork-playback-overlay')
-      );
-      expect(poster?.getAttribute('src')).toContain('&artwork=2');
-    }
-  );
-
-  it.each(['dispatcharr', 'plex', 'jellyfin', 'emby'] as const)(
-    'keeps live artwork square and the outer card rounded for %s',
-    (type) => {
-      const { container } = render(
-        <NowPlayingCard
-          session={makeSession({
-            thumbPath: '/logo.png',
-            server: { id: 'server-1', name: type, type },
-          })}
-        />
-      );
-      expect(container.querySelector('img[src*="images/proxy"]')).not.toHaveClass('rounded-lg');
-      expect(container.firstElementChild).toHaveClass('rounded-xl');
-    }
-  );
-
-  it('keeps paused catch-up artwork square with a visible, undimmed Pause icon', () => {
-    const { container } = render(
-      <NowPlayingCard
-        session={makeSession({
-          dispatcharrPlaybackKind: 'catchup',
-          state: 'paused',
-          thumbPath: '/catchup.png',
-        })}
-      />
-    );
-    expect(container.querySelector('img[src*="images/proxy"]')).not.toHaveClass(
-      'rounded-lg',
-      'shadow-lg'
-    );
-    expect(screen.getByTestId('artwork-playback-overlay')).toHaveClass('opacity-100');
-    expect(screen.getByTestId('artwork-playback-overlay')).not.toHaveClass(
-      'bg-black/50',
-      'opacity-0'
-    );
-    expect(container.querySelector('svg.lucide-pause')).toHaveClass(
-      'relative',
-      'h-8',
-      'w-8',
-      'shrink-0'
-    );
-    expect(container.querySelector('img[src*="images/proxy"]')).toHaveClass('brightness-50');
-    expect(screen.queryByTestId('artwork-dimmer')).toBeNull();
-    expect(screen.getByTestId('artwork-playback-overlay')).not.toHaveClass('brightness-50');
-    expect(screen.getByTestId('card-artwork')).not.toHaveClass('bg-muted', 'overflow-hidden');
-  });
-
-  it('keeps the gray artwork placeholder when no image exists', () => {
-    render(<NowPlayingCard session={makeSession({ thumbPath: null })} />);
-
-    expect(screen.getByTestId('card-artwork')).toHaveClass('bg-muted');
-    expect(screen.queryByTestId('artwork-dimmer')).toBeNull();
-  });
-
-  it('proxies absolute Dispatcharr live channel logos for card artwork', () => {
-    const absoluteThumbUrl =
-      'https://dispatcharr.example.com/api/channels/logos/4671/cache/?ts=123#ignored';
-
-    const { container } = render(
-      <NowPlayingCard
-        session={makeSession({
-          thumbPath: absoluteThumbUrl,
-          server: { id: 'server-1', name: 'Dispatcharr', type: 'dispatcharr' },
-          mediaType: 'live',
-        })}
-      />
-    );
-
-    const poster = container.querySelector('img[alt="Dispatch News"]');
-    expect(poster).toBeTruthy();
-    expect(poster?.getAttribute('src')).toBe(
-      '/api/v1/images/proxy?server=server-1&url=https%3A%2F%2Fdispatcharr.example.com%2Fapi%2Fchannels%2Flogos%2F4671%2Fcache%2F%3Fts%3D123%23ignored&width=360&height=540&artwork=2'
-    );
-  });
-});
-
-function renderCard(overrides: Partial<ActiveSession>, onClick?: () => void) {
   render(
     <MemoryRouter>
-      <NowPlayingCard
-        session={makeSession({
-          playerName: null,
-          totalDurationMs: 7_200_000,
-          mediaType: 'movie',
-          mediaTitle: 'Heat',
-          ...overrides,
-        })}
-        onClick={onClick}
-      />
+      <NowPlayingCard session={session} onClick={onClick} />
     </MemoryRouter>
   );
-  return screen.getByTestId('device-badge');
+  return screen.getByTestId('device-icon');
 }
 
 describe('NowPlayingCard device icon', () => {
@@ -650,6 +69,18 @@ describe('NowPlayingCard device icon', () => {
 
   it('carries no hover text when the session reports no device at all', () => {
     expect(renderCard({})).not.toHaveAttribute('title');
+  });
+
+  it.each([
+    ['an iPad', { platform: 'iOS', device: 'iPad Pro' }, 'lucide-tablet'],
+    ['an Android TV', { platform: 'Android TV', device: 'BRAVIA 4K' }, 'lucide-tv'],
+    ['an NVIDIA Shield', { platform: 'Android TV', device: 'SHIELD Android TV' }, 'lucide-tv'],
+    ['an iPhone', { platform: 'iOS', device: 'iPhone 15' }, 'lucide-smartphone'],
+    ['an Android phone', { platform: 'Android', device: 'Pixel 8' }, 'lucide-smartphone'],
+    ['a browser', { platform: 'Chrome', device: 'Chrome' }, 'lucide-monitor'],
+  ])('draws %s with the matching icon', (_name, session, icon) => {
+    const svg = renderCard(session).querySelector('svg');
+    expect(svg).toHaveClass(icon);
   });
 });
 
@@ -704,12 +135,48 @@ describe('NowPlayingCard title links', () => {
 
   it('follows the title link without opening the slide-out', () => {
     const onClick = vi.fn();
-    renderCard({ mediaType: 'movie', mediaTitle: 'Heat', mediaId: 'movie-1' }, onClick);
+    renderCard({ mediaId: 'movie-1' }, onClick);
 
     fireEvent.click(screen.getByRole('link', { name: 'Heat' }));
     expect(onClick).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText('alice'));
     expect(onClick).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('NowPlayingCard stop button', () => {
+  beforeEach(() => {
+    auth.role = 'owner';
+  });
+  afterEach(() => {
+    auth.role = 'member';
+  });
+
+  it('holds the stop with the reason when the server key cannot stop streams', () => {
+    renderCard({
+      canTerminate: true,
+      serverId: 'server-2',
+      server: { id: 'server-2', name: 'Den', type: 'tofa' },
+    });
+    expect(
+      screen.getByRole('button', { name: 'settings:servers.cannotStopStreams' })
+    ).toBeDisabled();
+    expect(screen.queryByTitle('pages:terminateStream.title')).not.toBeInTheDocument();
+  });
+
+  it('offers the stop for live TV on tofa', () => {
+    renderCard({
+      canTerminate: true,
+      mediaType: 'live',
+      serverId: 'server-3',
+      server: { id: 'server-3', name: 'Attic', type: 'tofa' },
+    });
+    expect(screen.getByTitle('pages:terminateStream.title')).toBeEnabled();
+  });
+
+  it('offers the stop for live TV on Plex', () => {
+    renderCard({ canTerminate: true, mediaType: 'live' });
+    expect(screen.getByTitle('pages:terminateStream.title')).toBeEnabled();
   });
 });

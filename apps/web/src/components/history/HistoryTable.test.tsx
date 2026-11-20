@@ -36,6 +36,7 @@ function makeSession(overrides: Partial<SessionWithDetails> = {}): SessionWithDe
   return {
     id: 'session-1',
     serverId: 'server-1',
+    profileName: null,
     serverUserId: 'user-1',
     sessionKey: 'sk-1',
     state: 'stopped',
